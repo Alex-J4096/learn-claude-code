@@ -16,8 +16,63 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"), auth_token=os.getenv("ANTHROPIC_AUTH_TOKEN"))
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = f"You are a coding agent at {os.getcwd()}. Use powershell to solve tasks. Act, don't explain."
+SYSTEM = f"""
+You are a coding agent at {os.getcwd()}. Since your working environment is Windows 11, use powershell instead of bash to solve tasks. Act, don't explain.
+Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Prefer tools over prose.
+"""
 
+class TodoManager:
+    def __init__(self):
+        self.items = []
+
+    def update(self, items: list) -> str:
+        if len(items) > 20:
+            raise ValueError("Max 20 todos allowed")
+
+        validated = []
+        in_progress_count = 0
+
+        for i, item in enumerate(items):
+            text = str(item.get("text", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            item_id = str(item.get("id", str(i + 1)))
+
+            if not text:
+                raise ValueError(f"Item {item_id} has no text")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Item {item_id} has invalid status '{status}'")
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"id": item_id, "text": text, "status": status})
+
+        if in_progress_count > 1:
+            raise ValueError("Only one task can be in_progress at a time")
+        self.items = validated
+        return self.render()
+
+    def render(self) -> str:
+        if not self.items:
+            return "No todos"
+        lines = []
+
+        for item in self.items:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
+            lines.append(f"{marker} #{item['id']}: {item['text']}")
+        done = sum(1 for t in self.items if t["status"] == "completed")
+        lines.append(f"\n{done}/{len(self.items)} completed")
+        return "\n".join(lines)
+
+TODO = TodoManager()
+
+TOOL_HANDLERS = {
+    "bash":       lambda **kw: run_bash(kw["command"]),
+    "powershell": lambda **kw: run_powershell(kw["command"]),
+    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "todo":       lambda **kw: TODO.update(kw["items"]),
+}
 TOOLS = [
     {
     "name": "bash",
@@ -62,11 +117,23 @@ TOOLS = [
         "description": "Replace exact text in file.",
         "input_schema": {
             "type": "object",
-            "properties": {"path": {"type": "string"}, "old_path": {"type": "string"}}, "new_text":{"type": "string"},
+            "properties": {
+                "path": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"}
+            },
             "required": ["path", "old_text", "new_text"]
         }
     },
-
+    {
+        "name": "todo",
+        "description": "Update task list. Track progress on multi-step tasks.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}},
+            "required": ["id", "text", "status"]}}}, "required": ["items"]
+        }
+    },
 
 ]
 
@@ -137,44 +204,51 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-TOOL_HANDLERS = {
-    "bash":       lambda **kw: run_bash(kw["command"]),
-    "powershell": lambda **kw: run_powershell(kw["command"]),
-    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-}
-
-
 def agent_loop(messages:list):
-    # i=1
+    rounds_since_todo = 0
 
     while True:
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages, tools=TOOLS,
             max_tokens=8000,
         )
-        # print(i,response.content)
         messages.append({"role": "assistant", "content": response.content})
 
         # 如果没有工具调用则结束
         if response.stop_reason != "tool_use":
             return
         # 若有工具调用，则执行，收集结果加入上下文
-        result = []
+        results = []
+        used_todo = False
+
         for block in response.content:
+
+            # print(block)
+
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler \
-                    else f"Unknown tool: {block.name}"
+
+                try:
+                    output = handler(**block.input) if handler \
+                        else "Unknown tool: {block.name}"
+                except Exception as e:
+                    output = f"Error: {e}"
+
+                # 打印工具调用的名称
                 print(f"> {block.name}:")
                 print(output[:200])
-                result.append(
+                results.append(
                     {"type": "tool_result",
                      "tool_use_id": block.id,
                      "content": output}
                 )
-        messages.append({"role": "user", "content": result})
+
+                if block.name == "todo":
+                    used_todo = True
+        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        if rounds_since_todo >= 3:
+            results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+        messages.append({"role": "user", "content": results})
 
 if __name__ == "__main__":
     history = []
@@ -196,3 +270,4 @@ if __name__ == "__main__":
                 if hasattr(block, "text"):
                     print(block.text)
         print()
+
