@@ -5,10 +5,6 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 import os
 
-from huggingface_hub.cli.inference_endpoints import resume
-
-from agents.s03_todo_write import WORKDIR
-
 load_dotenv(override=True)
 
 WORKDIR = Path.cwd()
@@ -17,10 +13,13 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"), auth_token=os.geten
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"""
-You are a coding agent at {os.getcwd()}. Since your working environment is Windows 11, use powershell instead of bash to solve tasks. Act, don't explain.
+You are a coding agent at {os.getcwd()}. Act, don't explain.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 Prefer tools over prose.
 """
+# Since your working environment is Windows 11, use powershell instead of bash to solve tasks.
+
+SUBAGENT_SYSTEM = f"You are a coding agent at {WORKDIR}. Complete the given task, then summarize your findings."
 
 class TodoManager:
     def __init__(self):
@@ -73,7 +72,7 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "todo":       lambda **kw: TODO.update(kw["items"]),
 }
-TOOLS = [
+CHILD_TOOLS = [
     {
     "name": "bash",
     "description": "Run a shell command.",
@@ -203,6 +202,14 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
+
+def run_subagent(prompt: str) -> str:
+    sub_messages=[{"role" : "user", "content": prompt}]
+    # subagent最大允许30轮循环
+    for _ in range(30):
+        response = client.messages.create(
+            model=MODEL, system=SUBAGENT_SYSTEM
+        )
 
 def agent_loop(messages:list):
     rounds_since_todo = 0
